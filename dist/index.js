@@ -32856,7 +32856,8 @@ const DRY_RUN = core.getInput("DRY_RUN") === "true";
 
 const START_MARKER = "<!--START_SECTION:activity-->";
 const END_MARKER = "<!--END_SECTION:activity-->";
-const TITLE_MAX_LENGTH = 72;
+const TITLE_MAX_LENGTH = 90;
+const SUMMARY_MAX_REPOS = 3;
 
 /**
  * Escapes characters that would break the markdown link/text
@@ -32872,10 +32873,14 @@ const escapeMarkdown = (str) => str.replace(/([\\`*_[\]<>|])/g, "\\$1");
  *
  * @returns {String}
  */
-const truncate = (title) =>
-  title.length > TITLE_MAX_LENGTH
-    ? `${title.slice(0, TITLE_MAX_LENGTH - 1).trimEnd()}…`
-    : title;
+const truncate = (title) => {
+  if (title.length <= TITLE_MAX_LENGTH) return title;
+  const cut = title.slice(0, TITLE_MAX_LENGTH - 1);
+  // Cut at the last word boundary unless that would drop most of the title
+  const space = cut.lastIndexOf(" ");
+  const kept = space > TITLE_MAX_LENGTH / 2 ? cut.slice(0, space) : cut;
+  return `${kept.replace(/[\s,;:.\-–—(]+$/, "")}…`;
+};
 
 /**
  * Formats a timestamp as `MM-DD HH:mm` in the configured timezone
@@ -33054,47 +33059,75 @@ const toEntry = async (octokit, event) => {
 /**
  * Renders one activity line
  * @param {Object} entry
+ * @param {Boolean} showRepo - whether to append the repo link
  *
  * @returns {String}
  */
-const serialize = ({ state, number, url, title, repo, time }) => {
+const serialize = ({ state, number, url, title, repo, time }, showRepo) => {
   const [emoji, verb] = state;
   const label = typeof number === "number" ? `#${number}` : number;
+  const repoPart = showRepo ? ` · ${repoLink(repo)}` : "";
   return `${emoji} ${verb} [${label}](${url}) ${escapeMarkdown(
     truncate(title),
-  )} · ${repoLink(repo)} · \`${formatTime(time)}\``;
+  )}${repoPart} · \`${formatTime(time)}\``;
 };
 
 /**
- * Builds the per-repo summary of PRs merged in the last SUMMARY_DAYS days
+ * Fetches the user's public PRs merged in the last `days` days
  * @param {Object} octokit
+ * @param {Number} days
  *
- * @returns {Promise<String | null>}
+ * @returns {Promise<Object[]>}
  */
-const buildSummary = async (octokit) => {
-  if (!SUMMARY_DAYS) return null;
-
-  const since = new Date(Date.now() - SUMMARY_DAYS * 24 * 60 * 60 * 1000)
+const fetchMergedPRs = (octokit, days) => {
+  const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000)
     .toISOString()
     .slice(0, 10);
-  const items = await octokit.paginate(
-    octokit.rest.search.issuesAndPullRequests,
-    {
-      q: `author:${GH_USERNAME} is:pr is:merged is:public merged:>=${since}`,
-      per_page: 100,
-    },
-  );
-  if (!items.length) return null;
+  return octokit.paginate(octokit.rest.search.issuesAndPullRequests, {
+    q: `author:${GH_USERNAME} is:pr is:merged is:public merged:>=${since}`,
+    per_page: 100,
+  });
+};
+
+/**
+ * Turns a search result for a merged PR into an activity entry
+ * @param {Object} item
+ *
+ * @returns {Object}
+ */
+const mergedPRToEntry = (item) => {
+  const repo = item.repository_url.split("/repos/")[1];
+  return {
+    key: `${repo}#${item.number}`,
+    state: STATES["PullRequestEvent:merged"],
+    number: item.number,
+    url: item.html_url,
+    title: item.title,
+    repo,
+    time: item.pull_request.merged_at || item.closed_at,
+  };
+};
+
+/**
+ * Builds the per-repo summary of merged PRs
+ * @param {Object[]} items - merged PRs from the search API
+ *
+ * @returns {String | null}
+ */
+const buildSummary = (items) => {
+  if (!SUMMARY_DAYS || !items.length) return null;
 
   const counts = {};
   for (const { repository_url } of items) {
     const fullName = repository_url.split("/repos/")[1];
     counts[fullName] = (counts[fullName] || 0) + 1;
   }
-  const repos = Object.entries(counts)
-    .sort((a, b) => b[1] - a[1])
-    .map(([fullName, count]) => `${repoLink(fullName)} ${count}`)
-    .join(" · ");
+  const sorted = Object.entries(counts).sort((a, b) => b[1] - a[1]);
+  const shown = sorted
+    .slice(0, SUMMARY_MAX_REPOS)
+    .map(([fullName, count]) => `${repoLink(fullName)} ${count}`);
+  const rest = sorted.length - SUMMARY_MAX_REPOS;
+  const repos = [...shown, ...(rest > 0 ? [`+${rest} more`] : [])].join(" · ");
 
   return `> 🟣 **${items.length}** PRs merged in the last ${SUMMARY_DAYS} days — ${repos}`;
 };
@@ -33121,7 +33154,7 @@ const run = async () => {
 
     // Keep only the latest state of each PR/issue
     const seen = new Set();
-    const entries = [];
+    let entries = [];
     for (const event of events) {
       if (entries.length >= MAX_LINES) break;
       if (!allowed.includes(event.type)) continue;
@@ -33129,6 +33162,18 @@ const run = async () => {
       if (!entry || seen.has(entry.key)) continue;
       seen.add(entry.key);
       entries.push(entry);
+    }
+
+    // Busy accounts can exhaust the 300-event window with reviews and pushes,
+    // so backfill with recently merged PRs from the search API
+    const mergedPRs = await fetchMergedPRs(octokit, SUMMARY_DAYS || 30);
+    if (allowed.includes("PullRequestEvent")) {
+      const backfill = mergedPRs
+        .map(mergedPRToEntry)
+        .filter(({ key }) => !seen.has(key));
+      entries = [...entries, ...backfill]
+        .sort((a, b) => new Date(b.time) - new Date(a.time))
+        .slice(0, MAX_LINES);
     }
 
     const readmeContent = fs.readFileSync(`./${TARGET_FILE}`, "utf-8");
@@ -33152,9 +33197,11 @@ const run = async () => {
       return;
     }
 
-    const summary = await buildSummary(octokit);
+    const summary = buildSummary(mergedPRs);
+    // The repo is noise when every entry comes from the same one
+    const showRepo = new Set(entries.map(({ repo }) => repo)).size > 1;
     const lines = entries.map(
-      (entry, idx) => `${idx + 1}. ${serialize(entry)}`,
+      (entry, idx) => `${idx + 1}. ${serialize(entry, showRepo)}`,
     );
     const section = [summary, summary && "", ...lines]
       .filter((line) => line !== null)
