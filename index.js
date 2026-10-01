@@ -8,49 +8,67 @@ const GH_USERNAME = core.getInput("GH_USERNAME");
 const COMMIT_NAME = core.getInput("COMMIT_NAME");
 const COMMIT_EMAIL = core.getInput("COMMIT_EMAIL");
 const COMMIT_MSG = core.getInput("COMMIT_MSG");
-const MAX_LINES = core.getInput("MAX_LINES");
+const MAX_LINES = parseInt(core.getInput("MAX_LINES"), 10);
 const TARGET_FILE = core.getInput("TARGET_FILE");
 const EMPTY_COMMIT_MSG = core.getInput("EMPTY_COMMIT_MSG");
 const FILTER_EVENTS = core.getInput("FILTER_EVENTS");
+const TIMEZONE = core.getInput("TIMEZONE");
+const SUMMARY_DAYS = parseInt(core.getInput("SUMMARY_DAYS"), 10);
+const DRY_RUN = core.getInput("DRY_RUN") === "true";
+
+const START_MARKER = "<!--START_SECTION:activity-->";
+const END_MARKER = "<!--END_SECTION:activity-->";
+const TITLE_MAX_LENGTH = 72;
 
 /**
- * Returns the sentence case representation
+ * Escapes characters that would break the markdown link/text
  * @param {String} str - the string
  *
  * @returns {String}
  */
-
-const capitalize = (str) => str.slice(0, 1).toUpperCase() + str.slice(1);
+const escapeMarkdown = (str) => str.replace(/([\\`*_[\]<>|])/g, "\\$1");
 
 /**
- * Returns a URL in markdown format for PR's and issues
- * @param {Object | String} item - holds information concerning the issue/PR
+ * Shortens long titles so each entry stays on one line
+ * @param {String} title - the title
  *
  * @returns {String}
  */
-const toUrlFormat = (item) => {
-  if (typeof item !== "object") {
-    return `[${item}](https://github.com/${item})`;
-  }
-  if (Object.hasOwnProperty.call(item.payload, "comment")) {
-    return `[#${item.payload.issue.number}](${item.payload.comment.html_url})`;
-  }
-  if (Object.hasOwnProperty.call(item.payload, "issue")) {
-    return `[#${item.payload.issue.number}](${item.payload.issue.html_url})`;
-  }
-  if (Object.hasOwnProperty.call(item.payload, "pull_request")) {
-    // GitHub Events API doesn't include html_url in pull_request object
-    // We need to construct it from repo name and PR number
-    const prNumber = item.payload.pull_request.number;
-    const repoName = item.repo.name;
-    return `[#${prNumber}](https://github.com/${repoName}/pull/${prNumber})`;
-  }
+const truncate = (title) =>
+  title.length > TITLE_MAX_LENGTH
+    ? `${title.slice(0, TITLE_MAX_LENGTH - 1).trimEnd()}…`
+    : title;
 
-  if (Object.hasOwnProperty.call(item.payload, "release")) {
-    const release = item.payload.release.name || item.payload.release.tag_name;
-    return `[${release}](${item.payload.release.html_url})`;
-  }
+/**
+ * Formats a timestamp as `MM-DD HH:mm` in the configured timezone
+ * @param {String} iso - ISO timestamp
+ *
+ * @returns {String}
+ */
+const formatTime = (iso) => {
+  const parts = Object.fromEntries(
+    new Intl.DateTimeFormat("en-CA", {
+      timeZone: TIMEZONE,
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      hourCycle: "h23",
+    })
+      .formatToParts(new Date(iso))
+      .map(({ type, value }) => [type, value]),
+  );
+  return `${parts.month}-${parts.day} ${parts.hour}:${parts.minute}`;
 };
+
+/**
+ * Returns a markdown link to the repo, labelled without the owner
+ * @param {String} fullName - e.g. QwenLM/qwen-code
+ *
+ * @returns {String}
+ */
+const repoLink = (fullName) =>
+  `[${fullName.split("/")[1]}](https://github.com/${fullName})`;
 
 /**
  * Execute shell command
@@ -132,60 +150,115 @@ const createEmptyCommit = async () => {
     return "Empty commit pushed";
   }
 
-  return "No PullRequest/Issue/IssueComment/Release events found. Leaving README unchanged with previous activity";
+  return "No matching events found. Leaving README unchanged with previous activity";
 };
 
-const serializers = {
-  IssueCommentEvent: (item) => {
-    return `🗣 Commented on ${toUrlFormat(item)} in ${toUrlFormat(
-      item.repo.name,
-    )}`;
-  },
-  IssuesEvent: (item) => {
-    let emoji = "ℹ️";
+// Emoji and verb per event state; states not listed here are skipped
+const STATES = {
+  "PullRequestEvent:opened": ["🔀", "Opened PR"],
+  "PullRequestEvent:reopened": ["🔀", "Reopened PR"],
+  "PullRequestEvent:merged": ["🟣", "Merged PR"],
+  "IssuesEvent:opened": ["📝", "Opened issue"],
+  "IssuesEvent:reopened": ["🔓", "Reopened issue"],
+  "IssuesEvent:closed": ["✅", "Closed issue"],
+  "IssueCommentEvent:created": ["💬", "Commented on"],
+  "ReleaseEvent:published": ["🚀", "Released"],
+};
 
-    switch (item.payload.action) {
-      case "opened":
-        emoji = "❗";
-        break;
-      case "reopened":
-        emoji = "🔓";
-        break;
-      case "closed":
-        emoji = "🔒";
-        break;
-    }
+/**
+ * Normalises an event into { key, state, number, url, title, repo, time },
+ * fetching the PR when the event payload lacks its title or merge state
+ * @param {Object} octokit
+ * @param {Object} event
+ *
+ * @returns {Promise<Object | null>}
+ */
+const toEntry = async (octokit, event) => {
+  const { payload, repo } = event;
+  const [owner, name] = repo.name.split("/");
+  let action = payload.action;
+  let number, url, title;
 
-    return `${emoji} ${capitalize(item.payload.action)} issue ${toUrlFormat(
-      item,
-    )} in ${toUrlFormat(item.repo.name)}`;
-  },
-  PullRequestEvent: (item) => {
-    let emoji = "ℹ️";
-    let actionText = capitalize(item.payload.action);
+  if (event.type === "PullRequestEvent") {
+    number = payload.pull_request.number;
+    url = `https://github.com/${repo.name}/pull/${number}`;
+    const { data: pr } = await octokit.rest.pulls.get({
+      owner,
+      repo: name,
+      pull_number: number,
+    });
+    title = pr.title;
+    if (action === "closed" && pr.merged_at) action = "merged";
+  } else if (event.type === "ReleaseEvent") {
+    number = payload.release.tag_name;
+    url = payload.release.html_url;
+    title = payload.release.name || payload.release.tag_name;
+  } else {
+    number = payload.issue.number;
+    url = payload.comment ? payload.comment.html_url : payload.issue.html_url;
+    title = payload.issue.title;
+  }
 
-    switch (item.payload.action) {
-      case "opened":
-        emoji = "💪";
-        actionText = "Opened";
-        break;
-      case "closed":
-        emoji = "❌";
-        actionText = "Closed";
-        break;
-      case "merged":
-        emoji = "🎉";
-        actionText = "Merged";
-        break;
-    }
+  const state = STATES[`${event.type}:${action}`];
+  if (!state) return null;
 
-    return `${emoji} ${actionText} PR ${toUrlFormat(item)} in ${toUrlFormat(item.repo.name)}`;
-  },
-  ReleaseEvent: (item) => {
-    return `🚀 ${capitalize(item.payload.action)} release ${toUrlFormat(
-      item,
-    )} in ${toUrlFormat(item.repo.name)}`;
-  },
+  return {
+    key: `${repo.name}#${number}`,
+    state,
+    number,
+    url,
+    title,
+    repo: repo.name,
+    time: event.created_at,
+  };
+};
+
+/**
+ * Renders one activity line
+ * @param {Object} entry
+ *
+ * @returns {String}
+ */
+const serialize = ({ state, number, url, title, repo, time }) => {
+  const [emoji, verb] = state;
+  const label = typeof number === "number" ? `#${number}` : number;
+  return `${emoji} ${verb} [${label}](${url}) ${escapeMarkdown(
+    truncate(title),
+  )} · ${repoLink(repo)} · \`${formatTime(time)}\``;
+};
+
+/**
+ * Builds the per-repo summary of PRs merged in the last SUMMARY_DAYS days
+ * @param {Object} octokit
+ *
+ * @returns {Promise<String | null>}
+ */
+const buildSummary = async (octokit) => {
+  if (!SUMMARY_DAYS) return null;
+
+  const since = new Date(Date.now() - SUMMARY_DAYS * 24 * 60 * 60 * 1000)
+    .toISOString()
+    .slice(0, 10);
+  const items = await octokit.paginate(
+    octokit.rest.search.issuesAndPullRequests,
+    {
+      q: `author:${GH_USERNAME} is:pr is:merged is:public merged:>=${since}`,
+      per_page: 100,
+    },
+  );
+  if (!items.length) return null;
+
+  const counts = {};
+  for (const { repository_url } of items) {
+    const fullName = repository_url.split("/repos/")[1];
+    counts[fullName] = (counts[fullName] || 0) + 1;
+  }
+  const repos = Object.entries(counts)
+    .sort((a, b) => b[1] - a[1])
+    .map(([fullName, count]) => `${repoLink(fullName)} ${count}`)
+    .join(" · ");
+
+  return `> 🟣 **${items.length}** PRs merged in the last ${SUMMARY_DAYS} days — ${repos}`;
 };
 
 const run = async () => {
@@ -198,52 +271,38 @@ const run = async () => {
     }
 
     const octokit = getOctokit(token);
+    const allowed = FILTER_EVENTS.split(",").map((type) => type.trim());
 
-    // Get the user's public events
+    // The events API returns at most 300 events, newest first
     core.debug(`Getting activity for ${GH_USERNAME}`);
-    const events = await octokit.rest.activity.listPublicEventsForUser({
-      username: GH_USERNAME,
-      per_page: 100,
-    });
-    core.debug(
-      `Activity for ${GH_USERNAME}, ${events.data.length} events found.`,
+    const events = await octokit.paginate(
+      octokit.rest.activity.listPublicEventsForUser,
+      { username: GH_USERNAME, per_page: 100 },
     );
+    core.debug(`Activity for ${GH_USERNAME}, ${events.length} events found.`);
 
-    const content = events.data
-      // Filter out any boring activity
-      .filter(
-        (event) =>
-          serializers.hasOwnProperty(event.type) &&
-          FILTER_EVENTS.includes(event.type),
-      )
-      // We only have five lines to work with
-      .slice(0, MAX_LINES)
-      // Call the serializer to construct a string
-      .map((item) => serializers[item.type](item));
+    // Keep only the latest state of each PR/issue
+    const seen = new Set();
+    const entries = [];
+    for (const event of events) {
+      if (entries.length >= MAX_LINES) break;
+      if (!allowed.includes(event.type)) continue;
+      const entry = await toEntry(octokit, event);
+      if (!entry || seen.has(entry.key)) continue;
+      seen.add(entry.key);
+      entries.push(entry);
+    }
 
-    const readmeContent = fs
-      .readFileSync(`./${TARGET_FILE}`, "utf-8")
-      .split("\n");
+    const readmeContent = fs.readFileSync(`./${TARGET_FILE}`, "utf-8");
+    const startIdx = readmeContent.indexOf(START_MARKER);
+    const endIdx = readmeContent.indexOf(END_MARKER);
 
-    // Find the index corresponding to <!--START_SECTION:activity--> comment
-    let startIdx = readmeContent.findIndex(
-      (content) => content.trim() === "<!--START_SECTION:activity-->",
-    );
-
-    // Early return in case the <!--START_SECTION:activity--> comment was not found
     if (startIdx === -1) {
-      core.setFailed(
-        "Couldn't find the <!--START_SECTION:activity--> comment. Exiting!",
-      );
+      core.setFailed(`Couldn't find the ${START_MARKER} comment. Exiting!`);
       return;
     }
 
-    // Find the index corresponding to <!--END_SECTION:activity--> comment
-    const endIdx = readmeContent.findIndex(
-      (content) => content.trim() === "<!--END_SECTION:activity-->",
-    );
-
-    if (content.length === 0) {
+    if (entries.length === 0) {
       core.info("Found no activity.");
 
       try {
@@ -255,80 +314,33 @@ const run = async () => {
       return;
     }
 
-    if (content.length < 5) {
-      core.info("Found less than 5 activities");
-    }
-
-    if (startIdx !== -1 && endIdx === -1) {
-      // Add one since the content needs to be inserted just after the initial comment
-      startIdx++;
-      content.forEach((line, idx) =>
-        readmeContent.splice(startIdx + idx, 0, `${idx + 1}. ${line}`),
-      );
-
-      // Append <!--END_SECTION:activity--> comment
-      readmeContent.splice(
-        startIdx + content.length,
-        0,
-        "<!--END_SECTION:activity-->",
-      );
-
-      // Update README
-      fs.writeFileSync(`./${TARGET_FILE}`, readmeContent.join("\n"));
-
-      // Commit to the remote repository
-      try {
-        await commitFile();
-      } catch (err) {
-        core.setFailed(err.message);
-        return;
-      }
-      core.info("Wrote to README");
-      return;
-    }
-
-    const oldContent = readmeContent.slice(startIdx + 1, endIdx).join("\n");
-    const newContent = content
-      .map((line, idx) => `${idx + 1}. ${line}`)
+    const summary = await buildSummary(octokit);
+    const lines = entries.map(
+      (entry, idx) => `${idx + 1}. ${serialize(entry)}`,
+    );
+    const section = [summary, summary && "", ...lines]
+      .filter((line) => line !== null)
       .join("\n");
 
-    if (oldContent.trim() === newContent.trim()) {
+    const before = readmeContent.slice(0, startIdx + START_MARKER.length);
+    const after =
+      endIdx === -1
+        ? `\n${END_MARKER}\n${readmeContent.slice(startIdx + START_MARKER.length)}`
+        : readmeContent.slice(endIdx);
+    const updated = `${before}\n\n${section}\n\n${after.trimStart()}`;
+
+    if (updated === readmeContent) {
       core.info("No changes detected");
       return;
     }
 
-    startIdx++;
+    fs.writeFileSync(`./${TARGET_FILE}`, updated);
+    core.info(`Updated ${TARGET_FILE} with the recent activity`);
 
-    // Recent GitHub Activity content between the comments
-    const readmeActivitySection = readmeContent.slice(startIdx, endIdx);
-    if (!readmeActivitySection.length) {
-      content.some((line, idx) => {
-        // User doesn't have 5 public events
-        if (!line) {
-          return true;
-        }
-        readmeContent.splice(startIdx + idx, 0, `${idx + 1}. ${line}`);
-      });
-      core.info(`Wrote to ${TARGET_FILE}`);
-    } else {
-      // It is likely that a newline is inserted after the <!--START_SECTION:activity--> comment (code formatter)
-      let count = 0;
-
-      readmeActivitySection.some((line, idx) => {
-        // User doesn't have 5 public events
-        if (!content[count]) {
-          return true;
-        }
-        if (line !== "") {
-          readmeContent[startIdx + idx] = `${count + 1}. ${content[count]}`;
-          count++;
-        }
-      });
-      core.info(`Updated ${TARGET_FILE} with the recent activity`);
+    if (DRY_RUN) {
+      core.info("DRY_RUN is set, skipping commit");
+      return;
     }
-
-    // Update README
-    fs.writeFileSync(`./${TARGET_FILE}`, readmeContent.join("\n"));
 
     // Commit to the remote repository
     try {

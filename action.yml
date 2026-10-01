@@ -33,7 +33,20 @@ inputs:
     required: false
   FILTER_EVENTS:
     description: "Events that should be displayed on profile"
-    default: "IssueCommentEvent,IssuesEvent,PullRequestEvent,ReleaseEvent"
+    default: "IssuesEvent,PullRequestEvent,ReleaseEvent"
+    required: false
+
+  TIMEZONE:
+    description: "IANA timezone used for activity timestamps"
+    default: "UTC"
+    required: false
+  SUMMARY_DAYS:
+    description: "Summarise PRs merged per repo over this many days (0 disables)"
+    default: 30
+    required: false
+  DRY_RUN:
+    description: "Write the file but skip commit and push"
+    default: "false"
     required: false
 
 branding:
